@@ -56,6 +56,144 @@ interface UrlTable
 	public function delUrl($url);
 }
 
+class UrlTablePostgres extends PDO implements UrlTable {
+	private $_table = '_urls';
+	private $_addCache=array();
+	
+	/**
+	 * @param string $name 设置数据库表名，默认 _urls
+	 */
+	public function setTableName($name)
+	{
+		$this->_table = $name;
+	}
+	
+	public function getCount()
+	{
+		$res = $this->query('SELECT COUNT(*) AS count FROM ' . $this->_table);
+		if ($res !== false)
+		{
+			$row = $res->fetchObject();
+			if ($res instanceof PDOStatement)
+			{
+				$res->closeCursor();
+				$res = null;
+			}
+			return $row->count;
+		}
+		return 0;
+	}
+	
+	public function getOne($duration = self::DURATION)
+	{
+		$urls = $this->getSome(1, $duration);
+		if (!is_array($urls))
+			return false;
+		return count($urls) > 0 ? $urls[0] : null;
+	}
+	
+	public function getSome($limit = 5, $duration = self::DURATION)
+	{
+		$now = time();
+		$sql = 'SELECT id, url, ((' . $now . ' - select_time) * (rank + 1) / (status + 1)) AS score FROM ' . $this->_table . ' ';
+		$sql .= 'WHERE select_time < ' . ($now - $duration) . ' '; // expired
+		$sql .= 'OR (select_time > update_time AND select_time < ' . ($now - 300) . ') '; // failed
+		$sql .= 'ORDER BY score DESC LIMIT ' . intval($limit);
+		($fd = @fopen(sys_get_temp_dir() . DIRECTORY_SEPARATOR . __CLASS__ . '.lock', 'w')) && flock($fd, LOCK_EX);
+		if (($res = $this->query($sql)) === false)
+			$ret = false;
+		else
+		{
+			$ret = $ids = array();
+			while ($row = $res->fetchObject())
+			{
+				$ids[] = $row->id;
+				$ret[] = $row->url;
+			}
+			if ($res instanceof PDOStatement)
+			{
+				$res->closeCursor();
+				$res = null;
+			}
+			if (count($ids) > 0)
+			{
+				$sql = 'UPDATE ' . $this->_table . ' SET select_time = ' . $now . ' ';
+				$sql .= 'WHERE id IN (\'' . implode('\', \'', $ids) . '\')';
+				$this->query($sql);
+			}
+		}
+		$fd && flock($fd, LOCK_UN) && fclose($fd);
+		return $ret;
+	}
+	
+	public function addUrl($url, $rank = 0)
+	{
+		$id = md5($url);
+		if ($this->inAddCache($id))
+			return false;
+		
+		$url = addcslashes(str_replace("'", "''", $url),"\000\n\r\\\032");
+		$sql = 'INSERT INTO ' . $this->_table . ' (id, url, rank) ';
+		$sql .= 'VALUES (\'' . $id . '\', \'' . $url . '\', ' . intval($rank) . ')';
+		return $this->query($sql);
+	}
+	
+	public function updateUrl($url, $status = 200)
+	{
+		$now = time();
+		$sql = 'UPDATE ' . $this->_table . ' SET status = ' . intval($status) . ', update_time = ' . $now . ' ';
+		$sql .= 'WHERE id = \'' . md5($url) . '\'';
+		return $this->query($sql);
+	}
+	
+	public function delUrl($url)
+	{
+		$sql = 'DELETE FROM ' . $this->_table . ' WHERE id = \'' . md5($url) . '\'';
+		return $this->query($sql)->rowCount() === 1;
+	}
+	
+	public function query($query, $mode = MYSQLI_STORE_RESULT)
+	{
+// 		$this->ping();
+		$res = parent::query($query, $mode);
+		return $res;
+	}
+	
+	protected function test()
+	{
+		if ($this->errorCode())
+			return trigger_error($this->errorInfo(), E_USER_ERROR);
+		$url = 'http://' . uniqid() . '.com/';
+		if (!$this->addUrl($url))
+			return trigger_error($this->errorInfo(), E_USER_ERROR);
+		$this->delUrl($url);
+		return true;
+	}
+	
+	private function inAddCache($id)
+	{
+		$now = time();
+		if (isset($this->_addCache[$id]))
+		{
+			$this->_addCache[$id] = $now;
+			return true;
+		}
+		$this->_addCache[$id] = $now;
+		if (count($this->_addCache) > 20000)
+		{
+			$cache = array();
+			$expire = $now - 3600;
+			foreach ($this->_addCache as $key => $value)
+			{
+				if ($value > $expire)
+					$cache[$key] = $value;
+			}
+			$this->_addCache = $cache;
+		}
+		return false;
+	}
+}
+
 /**
  * 基于 MySQLi 的 URL 列表管理，结构如下：
  * CREATE TABLE `_urls` (
@@ -373,7 +511,7 @@ class UrlParser implements HttpParser
 	 * @param HttpRequest $req
 	 * @param mixed $key
 	 */
-	public function parse($res, $req, $key)
+	public function parse($res, $req, $key, $callback='')
 	{
 		// update url
 		if ($this->_ut->updateUrl($req->getRawUrl(), $res->status))
@@ -381,6 +519,9 @@ class UrlParser implements HttpParser
 		// parse body
 		if ($res->status === 200)
 		{
+			if($callback!='') {
+				$this->{'parse'.$callback}($res->body);
+			}
 			// get baseUrl
 			$baseUrl = $req->getUrl();
 			if (preg_match('/<base\s+href=[\'"]?(.*?)[\s\'">]/i', $res->body, $match))
